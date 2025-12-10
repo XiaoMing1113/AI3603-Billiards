@@ -26,9 +26,10 @@ from agent import Agent, BasicAgent, NewAgent
 
 env = PoolEnv()
 results = {'AGENT_A_WIN': 0, 'AGENT_B_WIN': 0, 'SAME': 0}
-n_games = 40
+n_games = 5
 
-agent_a, agent_b = BasicAgent(), NewAgent()
+agent_a = NewAgent(model_path="sac_model.pth")
+agent_b = BasicAgent()
 
 players = [agent_a, agent_b]  # 用于切换先后手
 target_ball_choice = ['solid', 'solid', 'stripe', 'stripe']  # 轮换球型
