@@ -499,11 +499,11 @@ class PoolEnv():
         
         # return 一些这一杆的结果信息
         return {'ME_INTO_POCKET': own_pocketed, 'ENEMY_INTO_POCKET': enemy_pocketed, 'WHITE_BALL_INTO_POCKET': False, 'BLACK_BALL_INTO_POCKET': False, 'FOUL_FIRST_HIT': False, 'NO_POCKET_NO_RAIL': False, 'BALLS': copy.deepcopy(self.balls)}
-    
+
 
 if __name__ == '__main__':
     """一段测试PoolEnv的代码"""
-    
+
     # 初始化任务环境
     env = PoolEnv()
 
@@ -519,18 +519,17 @@ if __name__ == '__main__':
         else:
             action = agent_b.decision(balls, my_targets, table)
         env.take_shot(action)
-        
+
         # 观看当前杆，使用ESC退出
-        # pt.show(env.shot_record[-1], title=f"hit count: {env.hit_count}")
-        
+        pt.show(env.shot_record[-1], title=f"hit count: {env.hit_count}")
+
         done, info = env.get_done()
         if done:
             print("游戏结束.")
             ## 观看整个击球过程，使用ESC依次观看每一杆
             # for i in range(len(env.shot_record)):
             #     pt.show(env.shot_record[i], title=f"hit count: {i}")
-            
+
             ## 观看整个过程 使用 p 和 n 控制 上一杆/ 下一杆
             # pt.show(env.shot_record, title=f"all record")
             break
-        

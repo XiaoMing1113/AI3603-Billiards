@@ -191,6 +191,9 @@ cython_debug/
 # Ruff stuff:
 .ruff_cache/
 
+# TensorBoard / training outputs
+runs/
+
 # PyPI configuration file
 .pypirc
 
