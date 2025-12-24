@@ -193,6 +193,19 @@ cython_debug/
 
 # TensorBoard / training outputs
 runs/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.pkl
+*.joblib
+*.bin
+*.safetensors
+*.h5
+*.hdf5
+checkpoints/
+saved_models/
+weights/
 
 # PyPI configuration file
 .pypirc
