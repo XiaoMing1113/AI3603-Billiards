@@ -16,6 +16,7 @@ import time
 
 from utils import set_random_seed
 from poolenv import PoolEnv
+from agents import BasicAgent, BasicAgentPro, NewAgent
 from agent import BasicAgent, PyramidAgent
 
 # 设置随机种子，enable=True 时使用固定种子，enable=False 时使用完全随机
