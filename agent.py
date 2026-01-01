@@ -789,14 +789,23 @@ class PyramidAgent(Agent):
         # 优化器 (用于训练)
         self.optimizer = torch.optim.Adam(self.value_net.parameters(), lr=3e-4)
 
-        # if model_path and os.path.exists(model_path):
-        #     try:
-        #         self.value_net.load_state_dict(
-        #             torch.load(model_path, map_location=self.device)
-        #         )
-        #         print(f"[PyramidAgent] 成功加载价值网络: {model_path}")
-        #     except Exception as e:
-        #         print(f"[PyramidAgent] 加载模型失败: {e}")
+        self.value_net_enabled = False
+        self.value_coef = 0.05
+        self.value_clip = 300.0
+
+        if model_path:
+            if os.path.exists(model_path):
+                try:
+                    self.value_net.load_state_dict(
+                        torch.load(model_path, map_location=self.device)
+                    )
+                    self.target_value_net.load_state_dict(self.value_net.state_dict())
+                    self.value_net_enabled = True
+                    print(f"[PyramidAgent] 成功加载价值网络: {model_path}")
+                except Exception as e:
+                    print(f"[PyramidAgent] 加载模型失败: {e}")
+            else:
+                print(f"[PyramidAgent] 未找到价值网络文件: {model_path}")
 
         # 物理参数 (标准台球参数)
         self.BALL_RADIUS = 0.028575
@@ -854,53 +863,135 @@ class PyramidAgent(Agent):
                 # 这里简单判断紧密度
                 mean_std = np.mean(std_dev)
 
-                if mean_std < 0.15:  # 经验阈值，球堆紧密
-                    remaining_own = [
+                if mean_std < 0.05:  # 经验阈值，球堆紧密
+                    alive_ids = [
                         bid
-                        for bid in my_targets
-                        if bid in balls and balls[bid].state.s != 4
+                        for bid, ball in balls.items()
+                        if bid != "cue" and ball.state.s != 4
                     ]
-                    candidates_for_break = (
-                        remaining_own
-                        if len(remaining_own) > 0
-                        else (
-                            ["8"] if ("8" in balls and balls["8"].state.s != 4) else []
+                    if alive_ids:
+                        alive_ids.sort(
+                            key=lambda bid: float(
+                                np.linalg.norm(balls[bid].state.rvw[0] - cue_pos)
+                            )
                         )
-                    )
-                    if not candidates_for_break:
-                        candidates_for_break = [
+
+                        remaining_own = [
                             bid
-                            for bid, ball in balls.items()
-                            if bid != "cue" and ball.state.s != 4
+                            for bid in my_targets
+                            if bid in balls and balls[bid].state.s != 4
                         ]
+                        apex_id = alive_ids[0]
+                        second_id = (
+                            alive_ids[1] if len(alive_ids) >= 2 else alive_ids[0]
+                        )
+                        visible_own = []
+                        r = float(self.BALL_RADIUS)
+                        block_r = 2.0 * r + 0.002
+                        for tid in remaining_own:
+                            target_pos = balls[tid].state.rvw[0]
+                            v = target_pos - cue_pos
+                            dist = float(np.linalg.norm(v[:2]))
+                            if dist < 1e-9:
+                                continue
+                            direction = v[:2] / dist
+                            blocked = False
+                            for oid, oball in balls.items():
+                                if oid == "cue" or oid == tid:
+                                    continue
+                                if oball.state.s == 4:
+                                    continue
+                                other_pos = oball.state.rvw[0]
+                                w = other_pos - cue_pos
+                                proj = float(w[0] * direction[0] + w[1] * direction[1])
+                                if proj <= 0.0 or proj >= dist - 1e-4:
+                                    continue
+                                perp = w[:2] - proj * direction
+                                if float(np.dot(perp, perp)) <= block_r * block_r:
+                                    blocked = True
+                                    break
+                            if not blocked:
+                                visible_own.append((dist, tid))
 
-                    min_dist = float("inf")
-                    apex_ball_id = None
-                    for bid in candidates_for_break:
-                        dist = np.linalg.norm(balls[bid].state.rvw[0] - cue_pos)
-                        if dist < min_dist:
-                            min_dist = dist
-                            apex_ball_id = bid
+                        if visible_own:
+                            visible_own.sort(key=lambda x: x[0])
+                            break_target_id = visible_own[0][1]
+                        else:
+                            break_target_id = (
+                                apex_id if apex_id in remaining_own else second_id
+                            )
 
-                    if apex_ball_id:
-                        # 生成对着这个球的大力击球
-                        apex_pos = balls[apex_ball_id].state.rvw[0]
-                        vec = self._get_vector(cue_pos, apex_pos)
-                        phi = np.degrees(np.arctan2(vec[1], vec[0])) % 360
+                        target_pos = balls[break_target_id].state.rvw[0]
+                        vec = self._get_vector(cue_pos, target_pos)
+                        phi_base = np.degrees(np.arctan2(vec[1], vec[0])) % 360
+                        phi_aim = phi_base
+
+                        rack_center = np.mean(ball_positions, axis=0)
+                        apex_pos = balls[apex_id].state.rvw[0]
+                        axis_dir = apex_pos - rack_center
+                        axis_dir_norm = float(np.linalg.norm(axis_dir))
+                        if axis_dir_norm > 1e-9:
+                            axis_dir = axis_dir / axis_dir_norm
+                        else:
+                            axis_dir = vec / max(float(np.linalg.norm(vec)), 1e-9)
+
+                        o = rack_center - target_pos
+                        b = 2.0 * float(np.dot(o, axis_dir))
+                        c = float(np.dot(o, o)) - r * r
+                        disc = b * b - 4.0 * c
+                        if disc >= 0.0:
+                            sqrt_disc = float(np.sqrt(disc))
+                            t1 = (-b - sqrt_disc) / 2.0
+                            t2 = (-b + sqrt_disc) / 2.0
+                            best_phi = None
+                            best_abs_diff = None
+                            for t in (t1, t2):
+                                contact_point = rack_center + t * axis_dir
+                                u = (target_pos - contact_point) / r
+                                u_norm = float(np.linalg.norm(u))
+                                if u_norm < 1e-9:
+                                    continue
+                                u = u / u_norm
+                                cue_contact_center = target_pos - u * (2.0 * r)
+                                aim_vec = cue_contact_center - cue_pos
+                                aim_norm = float(np.linalg.norm(aim_vec))
+                                if aim_norm < 1e-9:
+                                    continue
+                                phi_candidate = (
+                                    float(
+                                        np.degrees(np.arctan2(aim_vec[1], aim_vec[0]))
+                                    )
+                                    % 360.0
+                                )
+                                diff = (
+                                    phi_candidate - phi_base + 180.0
+                                ) % 360.0 - 180.0
+                                abs_diff = abs(float(diff))
+                                if best_abs_diff is None or abs_diff < best_abs_diff:
+                                    best_abs_diff = abs_diff
+                                    best_phi = phi_candidate
+                            if best_phi is not None:
+                                phi_aim = best_phi
+
+                        break_v0 = 6.0
+                        break_dphi = -3.3
+                        phi_break = float((phi_aim + break_dphi) % 360.0)
 
                         print(
-                            f"[PyramidAgent] 检测到开球局面 (球堆紧密 std={mean_std:.3f})，直接生成开球动作"
+                            f"[PyramidAgent] 检测到开球局面 (球堆紧密 std={mean_std:.3f})，使用快速开球策略 (V0={break_v0}, dphi={break_dphi})"
                         )
                         return [
                             {
-                                "target_id": apex_ball_id,
-                                "V0": 6.0,
-                                "phi": phi,
+                                "target_id": break_target_id,
+                                "V0": break_v0,
+                                "phi": phi_break,
                                 "theta": 0,
                                 "a": 0,
                                 "b": 0,
-                                "cut_angle": 0,
-                                "type": "break",
+                                "cut_angle": abs(
+                                    (phi_break - phi_base + 180.0) % 360.0 - 180.0
+                                ),
+                                "type": "break_fast",
                             }
                         ]
 
@@ -1422,10 +1513,16 @@ class PyramidAgent(Agent):
 
         # 噪声参数 (模拟执行误差)
         NOISE_PHI = 0.2  # 度
-        NOISE_V0 = 0.05  # m/s
+        NOISE_V0 = 0.1  # m/s
+        NOISE_THETA = 0.1  # 度
+        NOISE_A = 0.003
+        NOISE_B = 0.003
 
         scratch_count = 0  # 白球进袋计数
         foul_count = 0
+        illegal_eight_first_hit_count = 0
+        early_eight_pocket_count = 0
+        scratch_and_eight_count = 0
 
         # 针对黑8或关键球增加模拟次数
         is_critical = False
@@ -1460,16 +1557,29 @@ class PyramidAgent(Agent):
             shot = pt.System(table=sim_table, balls=sim_balls, cue=cue)
 
             # 施加噪声
-            actual_phi = candidate["phi"] + np.random.normal(0, NOISE_PHI)
+            actual_phi = float(
+                (candidate["phi"] + np.random.normal(0, NOISE_PHI)) % 360.0
+            )
             actual_v0 = candidate["V0"] + np.random.normal(0, NOISE_V0)
             actual_v0 = np.clip(actual_v0, 0.5, 8.0)
+            actual_theta = float(
+                np.clip(
+                    candidate["theta"] + np.random.normal(0, NOISE_THETA), 0.0, 90.0
+                )
+            )
+            actual_a = float(
+                np.clip(candidate["a"] + np.random.normal(0, NOISE_A), -0.5, 0.5)
+            )
+            actual_b = float(
+                np.clip(candidate["b"] + np.random.normal(0, NOISE_B), -0.5, 0.5)
+            )
 
             shot.cue.set_state(
                 V0=actual_v0,
                 phi=actual_phi,
-                theta=candidate["theta"],
-                a=candidate["a"],
-                b=candidate["b"],
+                theta=actual_theta,
+                a=actual_a,
+                b=actual_b,
             )
 
             # 运行物理引擎
@@ -1517,6 +1627,26 @@ class PyramidAgent(Agent):
             if foul_first_hit or foul_no_rail:
                 foul_count += 1
 
+            if (
+                (target_id != "8")
+                and (first_contact_ball_id == "8")
+                and ("8" in sim_balls and sim_balls["8"].state.s != 4)
+            ):
+                illegal_eight_first_hit_count += 1
+
+            eight_pocketed = (
+                "8" in shot.balls
+                and shot.balls["8"].state.s == 4
+                and ("8" in sim_balls and sim_balls["8"].state.s != 4)
+            )
+            if (target_id != "8") and eight_pocketed:
+                early_eight_pocket_count += 1
+
+            if (
+                "cue" in shot.balls and shot.balls["cue"].state.s == 4
+            ) and eight_pocketed:
+                scratch_and_eight_count += 1
+
             # 严重惩罚：白球进袋
             if shot.balls["cue"].state.s == 4:
                 # 如果白球进了，这不仅不是成功，还是大事故
@@ -1546,10 +1676,21 @@ class PyramidAgent(Agent):
         prob = success_count / current_n_sims
         scratch_prob = scratch_count / current_n_sims  # 白球进袋概率
         foul_prob = foul_count / current_n_sims
+        illegal_eight_first_hit_prob = illegal_eight_first_hit_count / current_n_sims
+        early_eight_pocket_prob = early_eight_pocket_count / current_n_sims
+        scratch_and_eight_prob = scratch_and_eight_count / current_n_sims
 
         avg_state_dict = final_states[0]  # 简化
 
-        return prob, scratch_prob, foul_prob, avg_state_dict
+        return (
+            prob,
+            scratch_prob,
+            foul_prob,
+            illegal_eight_first_hit_prob,
+            early_eight_pocket_prob,
+            scratch_and_eight_prob,
+            avg_state_dict,
+        )
 
     def process_state(self, balls, my_targets, table):
         """复用 NewAgent 的状态处理"""
@@ -1586,6 +1727,9 @@ class PyramidAgent(Agent):
 
         # 1. 底层：生成候选
         candidates = self._generate_candidates(balls, my_targets, table)
+
+        if candidates and candidates[0].get("type") == "break_fast":
+            return candidates[0]
 
         if not candidates:
             # 智能保底策略 (Smart Fallback)
@@ -1716,53 +1860,199 @@ class PyramidAgent(Agent):
 
         scratch_penalty = 250.0
         foul_penalty = 150.0
-        quick_n_sims = 8 if len(remaining_own_before) == 0 else 4
+        illegal_eight_first_hit_penalty = 1200.0
+        early_eight_pocket_penalty = 2500.0
+        scratch_and_eight_penalty = 3000.0
+        base_quick_n_sims = 8 if len(remaining_own_before) == 0 else 4
+        quick_n_sims = 12 if len(candidates) <= 6 else base_quick_n_sims
         scored = []
         for cand in candidates:
-            prob, scratch_prob, foul_prob, _ = self._simulate_shot(
-                cand, table, balls, n_sims=quick_n_sims
+            alpha = 0.05
+            (
+                prob,
+                scratch_prob,
+                foul_prob,
+                illegal_eight_first_hit_prob,
+                early_eight_pocket_prob,
+                scratch_and_eight_prob,
+                _,
+            ) = self._simulate_shot(cand, table, balls, n_sims=quick_n_sims)
+            n_est = float(quick_n_sims)
+            illegal_eight_first_hit_prob = float(
+                (illegal_eight_first_hit_prob * n_est + alpha) / (n_est + 2.0 * alpha)
+            )
+            early_eight_pocket_prob = float(
+                (early_eight_pocket_prob * n_est + alpha) / (n_est + 2.0 * alpha)
+            )
+            scratch_and_eight_prob = float(
+                (scratch_and_eight_prob * n_est + alpha) / (n_est + 2.0 * alpha)
             )
             if cand["target_id"] == "8":
                 success_reward = 300.0 if len(remaining_own_before) == 0 else -900.0
             else:
                 success_reward = 100.0
+            illegal8_term = (
+                0.0
+                if len(remaining_own_before) == 0
+                else (
+                    illegal_eight_first_hit_penalty * illegal_eight_first_hit_prob
+                    + early_eight_pocket_penalty * early_eight_pocket_prob
+                )
+            )
+            if (len(remaining_own_before) > 0) and (
+                (early_eight_pocket_prob * n_est >= 1.0)
+                or (scratch_and_eight_prob * n_est >= 1.0)
+                or (illegal_eight_first_hit_prob * n_est >= 1.0)
+            ):
+                continue
             rough_ev = (
                 prob * success_reward
                 + (1 - prob) * (-0.5)
                 - scratch_penalty * scratch_prob
                 - foul_penalty * foul_prob
+                - scratch_and_eight_penalty * scratch_and_eight_prob
+                - illegal8_term
             )
             scored.append((rough_ev, cand))
+
+        if not scored:
+            for cand in candidates:
+                alpha = 0.05
+                (
+                    prob,
+                    scratch_prob,
+                    foul_prob,
+                    illegal_eight_first_hit_prob,
+                    early_eight_pocket_prob,
+                    scratch_and_eight_prob,
+                    _,
+                ) = self._simulate_shot(cand, table, balls, n_sims=quick_n_sims)
+                n_est = float(quick_n_sims)
+                illegal_eight_first_hit_prob = float(
+                    (illegal_eight_first_hit_prob * n_est + alpha)
+                    / (n_est + 2.0 * alpha)
+                )
+                early_eight_pocket_prob = float(
+                    (early_eight_pocket_prob * n_est + alpha) / (n_est + 2.0 * alpha)
+                )
+                scratch_and_eight_prob = float(
+                    (scratch_and_eight_prob * n_est + alpha) / (n_est + 2.0 * alpha)
+                )
+                if cand["target_id"] == "8":
+                    success_reward = 300.0 if len(remaining_own_before) == 0 else -900.0
+                else:
+                    success_reward = 100.0
+                illegal8_term = (
+                    0.0
+                    if len(remaining_own_before) == 0
+                    else (
+                        illegal_eight_first_hit_penalty * illegal_eight_first_hit_prob
+                        + early_eight_pocket_penalty * early_eight_pocket_prob
+                    )
+                )
+                risk_score = -(
+                    1e6 * early_eight_pocket_prob
+                    + 8e5 * scratch_and_eight_prob
+                    + 2e5 * illegal_eight_first_hit_prob
+                    + 2e4 * scratch_prob
+                    + 1e4 * foul_prob
+                )
+                scored.append((risk_score, cand))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         top_k = min(12, len(scored))
         eval_candidates = [cand for _, cand in scored[:top_k]]
 
+        best_risk_score = -float("inf")
+        best_risk_action = None
         for cand in eval_candidates:
-            prob, scratch_prob, foul_prob, final_balls = self._simulate_shot(
-                cand, table, balls
+            alpha = 0.05
+            (
+                prob,
+                scratch_prob,
+                foul_prob,
+                illegal_eight_first_hit_prob,
+                early_eight_pocket_prob,
+                scratch_and_eight_prob,
+                final_balls,
+            ) = self._simulate_shot(
+                cand,
+                table,
+                balls,
+                n_sims=40 if cand["target_id"] == "8" else 24,
             )
+            n_est = 40.0 if cand["target_id"] == "8" else 24.0
+            illegal_eight_first_hit_prob = float(
+                (illegal_eight_first_hit_prob * n_est + alpha) / (n_est + 2.0 * alpha)
+            )
+            early_eight_pocket_prob = float(
+                (early_eight_pocket_prob * n_est + alpha) / (n_est + 2.0 * alpha)
+            )
+            scratch_and_eight_prob = float(
+                (scratch_and_eight_prob * n_est + alpha) / (n_est + 2.0 * alpha)
+            )
+            risk_score = -(
+                1e6 * early_eight_pocket_prob
+                + 8e5 * scratch_and_eight_prob
+                + 2e5 * illegal_eight_first_hit_prob
+                + 2e4 * scratch_prob
+                + 1e4 * foul_prob
+            )
+            if risk_score > best_risk_score:
+                best_risk_score = risk_score
+                best_risk_action = cand
             state_tensor = self.process_state(final_balls, my_targets, table).unsqueeze(
                 0
             )
-            with torch.no_grad():
-                position_value = self.value_net(state_tensor).item()
+            position_value = 0.0
+            if self.value_net_enabled:
+                with torch.no_grad():
+                    raw_position_value = self.value_net(state_tensor).item()
+                if np.isfinite(raw_position_value):
+                    position_value = (
+                        float(
+                            np.clip(
+                                raw_position_value, -self.value_clip, self.value_clip
+                            )
+                        )
+                        * self.value_coef
+                    )
 
             if cand["target_id"] == "8":
                 success_reward = 300.0 if len(remaining_own_before) == 0 else -900.0
             else:
                 success_reward = 100.0
+            illegal8_term = (
+                0.0
+                if len(remaining_own_before) == 0
+                else (
+                    illegal_eight_first_hit_penalty * illegal_eight_first_hit_prob
+                    + early_eight_pocket_penalty * early_eight_pocket_prob
+                )
+            )
+            if (len(remaining_own_before) > 0) and (
+                (early_eight_pocket_prob * n_est >= 1.0)
+                or (scratch_and_eight_prob * n_est >= 1.0)
+                or (illegal_eight_first_hit_prob * n_est >= 1.0)
+            ):
+                continue
 
             expected_value = (
                 prob * (success_reward + 0.99 * position_value)
                 + (1 - prob) * (-0.5)
                 - scratch_penalty * scratch_prob
                 - foul_penalty * foul_prob
+                - scratch_and_eight_penalty * scratch_and_eight_prob
+                - illegal8_term
             )
 
             if expected_value > best_score:
                 best_score = expected_value
                 best_action = cand
+
+        if best_score == -float("inf") and best_risk_action is not None:
+            best_score = best_risk_score
+            best_action = best_risk_action
 
         print(
             f"[PyramidAgent] 最佳选择: 目标{best_action['target_id']}, "
